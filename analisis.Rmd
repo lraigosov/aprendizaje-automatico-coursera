@@ -1,0 +1,137 @@
+---
+title: "Predicción de la calidad del levantamiento de mancuerna con datos de acelerómetros"
+author: "Luis Raigoso"
+date: "`r format(Sys.Date(), '%d/%m/%Y')`"
+output:
+  html_document:
+    toc: true
+    self_contained: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.width = 7, fig.height = 4)
+library(randomForest)
+library(ggplot2)
+set.seed(2026)
+```
+
+## Resumen
+
+El objetivo es predecir la variable `classe` (A–E), que indica cómo 6 participantes realizaron levantamientos de mancuerna: A es la forma correcta y B–E corresponden a cuatro errores típicos. Se usan los datos de acelerómetros del cinturón, antebrazo, brazo y mancuerna. Se entrena un Random Forest, se valida con validación cruzada de 5 particiones y con un conjunto de validación apartado, y se predicen los 20 casos de prueba.
+
+Fuente de datos: Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H. *Qualitative Activity Recognition of Weight Lifting Exercises*. Proceedings of 4th International Conference in Cooperation with SIGCHI (Augmented Human '13). Stuttgart, 2013. <http://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har>
+
+## Carga y limpieza
+
+```{r carga}
+train_raw <- read.csv("base/pml-training.csv", na.strings = c("NA", "", "#DIV/0!"))
+test_raw  <- read.csv("base/pml-testing.csv",  na.strings = c("NA", "", "#DIV/0!"))
+dim(train_raw); dim(test_raw)
+```
+
+Decisiones de limpieza:
+
+1. Se eliminan las columnas de identificación y tiempo (`X`, usuario, marcas de tiempo, ventanas). Dejarlas permitiría "hacer trampa": `X` está ordenada por `classe`.
+2. Se eliminan las columnas con más del 90 % de valores faltantes (son estadísticos resumen de cada ventana, y en los 20 casos de prueba están vacíos, por lo que no sirven para predecir).
+3. Se conservan solo las variables presentes y numéricas en el conjunto de prueba.
+
+```{r limpieza}
+id_cols <- 1:7
+tr <- train_raw[, -id_cols]
+te <- test_raw[,  -id_cols]
+
+pct_na <- colMeans(is.na(tr))
+keep <- names(pct_na)[pct_na < 0.9]
+keep <- setdiff(keep, "classe")
+keep <- keep[sapply(tr[keep], is.numeric)]
+keep <- keep[keep %in% names(te) & colSums(is.na(te[keep])) == 0]
+
+tr <- data.frame(tr[keep], classe = factor(train_raw$classe))
+te <- te[keep]
+length(keep)
+```
+
+Quedan `r length(keep)` predictores sin valores faltantes.
+
+```{r clases, fig.cap="Distribución de la variable classe en el entrenamiento."}
+ggplot(tr, aes(classe, fill = classe)) + geom_bar(show.legend = FALSE) +
+  labs(x = "classe", y = "Observaciones") + theme_minimal()
+```
+
+Las clases están razonablemente balanceadas (A es la más frecuente), por lo que la exactitud es una métrica adecuada.
+
+## Estrategia de modelado y validación
+
+- **Partición**: 70 % entrenamiento / 30 % validación (estratificada por `classe`). El 30 % no se toca hasta el final y da una estimación independiente del error fuera de muestra.
+- **Validación cruzada**: 5 particiones sobre el 70 % de entrenamiento, para comparar el número de variables por árbol (`mtry`) y estimar el error.
+- **Modelo**: Random Forest. Maneja bien relaciones no lineales e interacciones entre sensores, no requiere escalar variables y es robusto a predictores correlacionados.
+
+```{r particion}
+idx <- unlist(lapply(split(seq_len(nrow(tr)), tr$classe),
+                     function(i) sample(i, round(0.7 * length(i)))))
+train <- tr[idx, ]
+valid <- tr[-idx, ]
+c(train = nrow(train), valid = nrow(valid))
+```
+
+```{r cv}
+k <- 5
+folds <- sample(rep(1:k, length.out = nrow(train)))
+mtrys <- c(4, 8, 16, 27)
+
+cv_res <- do.call(rbind, lapply(mtrys, function(m) {
+  acc <- sapply(1:k, function(f) {
+    fit <- randomForest(classe ~ ., data = train[folds != f, ], mtry = m, ntree = 150)
+    mean(predict(fit, train[folds == f, ]) == train$classe[folds == f])
+  })
+  data.frame(mtry = m, acc_media = mean(acc), sd = sd(acc))
+}))
+cv_res
+```
+
+```{r cvplot, fig.cap="Exactitud de validación cruzada (5 particiones) según mtry."}
+ggplot(cv_res, aes(mtry, acc_media)) +
+  geom_line() + geom_point() +
+  geom_errorbar(aes(ymin = acc_media - sd, ymax = acc_media + sd), width = 0.5) +
+  labs(x = "mtry", y = "Exactitud CV") + theme_minimal()
+```
+
+```{r final}
+best_m <- cv_res$mtry[which.max(cv_res$acc_media)]
+modelo <- randomForest(classe ~ ., data = train, mtry = best_m, ntree = 300, importance = TRUE)
+modelo
+```
+
+Se elige `mtry = ` `r best_m` por mayor exactitud en validación cruzada.
+
+## Error fuera de muestra
+
+```{r valid}
+pred_valid <- predict(modelo, valid)
+cm <- table(Predicho = pred_valid, Real = valid$classe)
+cm
+acc_valid <- mean(pred_valid == valid$classe)
+acc_valid
+```
+
+La exactitud en el conjunto de validación es **`r sprintf("%.2f %%", 100 * acc_valid)`**, por lo que el **error esperado fuera de muestra es de aproximadamente `r sprintf("%.2f %%", 100 * (1 - acc_valid))`**. Es coherente con el error OOB del bosque y con la validación cruzada (`r sprintf("%.2f %%", 100 * (1 - max(cv_res$acc_media)))`). Aviso: la validación aleatoria mezcla ventanas del mismo participante entre entrenamiento y validación, así que el error en participantes nuevos podría ser algo mayor.
+
+```{r imp, fig.cap="Las 15 variables más importantes (disminución media del índice Gini).", fig.height=5}
+imp <- data.frame(variable = rownames(modelo$importance),
+                  gini = modelo$importance[, "MeanDecreaseGini"])
+imp <- head(imp[order(-imp$gini), ], 15)
+ggplot(imp, aes(reorder(variable, gini), gini)) + geom_col() + coord_flip() +
+  labs(x = NULL, y = "Disminución media del Gini") + theme_minimal()
+```
+
+## Predicción de los 20 casos de prueba
+
+Se reentrena con todos los datos de entrenamiento (`mtry` elegido) y se predice.
+
+```{r test}
+modelo_final <- randomForest(classe ~ ., data = tr, mtry = best_m, ntree = 300)
+pred_test <- predict(modelo_final, te)
+data.frame(caso = seq_along(pred_test), prediccion = pred_test)
+```
+
+Respuestas para el cuestionario: `r paste(as.character(pred_test), collapse = " ")`
